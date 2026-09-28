@@ -1,0 +1,241 @@
+name: ChatGPT schizophrenia repeated nested CV
+
+on:
+  push:
+    branches:
+      - chatgpt-schz-pilot
+  workflow_dispatch:
+
+jobs:
+  repeated-nested-cv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy scipy pandas scikit-learn
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Fetch public multimodal schizophrenia data
+        run: |
+          git clone --depth 1 https://github.com/leoguti85/BiomarkersSCHZ.git /tmp/BiomarkersSCHZ
+          ls -lh /tmp/BiomarkersSCHZ/SC /tmp/BiomarkersSCHZ/FC
+
+      - name: Run repeated nested stratified CV
+        run: |
+          cat > /tmp/run_nested.py <<'PY'
+          import json, random, math
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          import scipy.io
+          from scipy import stats
+          from sklearn.model_selection import StratifiedKFold, GridSearchCV
+          from sklearn.pipeline import Pipeline
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.decomposition import PCA
+          from sklearn.svm import SVC
+          from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+          import torch
+          import torch.nn as nn
+
+          ROOT = Path('/tmp/BiomarkersSCHZ')
+          OUT = Path('nested_outputs')
+          OUT.mkdir(exist_ok=True)
+
+          N_REPEATS = 5
+          OUTER_FOLDS = 5
+          INNER_FOLDS = 4
+          BASE_SEED = 20260928
+
+          def seed_all(seed):
+              random.seed(seed)
+              np.random.seed(seed)
+              torch.manual_seed(seed)
+              torch.set_num_threads(1)
+
+          idx = pd.read_csv(ROOT/'Data Description'/'selected_subjects_27.csv', header=None).values.ravel().astype(int)
+          Xs = scipy.io.loadmat(ROOT/'SC'/'features_BoE_SC_83.mat')['features'].T[idx].astype(np.float32)
+          Xf = scipy.io.loadmat(ROOT/'FC'/'features_BoE_FC_83.mat')['features'].T[idx].astype(np.float32)
+          y = np.r_[np.ones(27, dtype=int), np.zeros(27, dtype=int)]
+          Xcat = np.concatenate([Xs, Xf], axis=1)
+
+          def metric_dict(y_true, y_pred, y_score):
+              tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0,1]).ravel()
+              return {
+                  'accuracy': float(accuracy_score(y_true, y_pred)),
+                  'precision': float(precision_score(y_true, y_pred, zero_division=0)),
+                  'sensitivity_recall': float(recall_score(y_true, y_pred, zero_division=0)),
+                  'specificity': float(tn/(tn+fp)) if (tn+fp) else float('nan'),
+                  'f1': float(f1_score(y_true, y_pred, zero_division=0)),
+                  'auc': float(roc_auc_score(y_true, y_score)),
+                  'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp)
+              }
+
+          MODELS = ['Structural-only tuned SVM','Functional-only tuned SVM','Early-fusion tuned SVM','Regularized gated-attention fusion']
+          fold_rows = []
+          prediction_rows = []
+          pooled_conf = {m: np.zeros((2,2), dtype=int) for m in MODELS}
+
+          svm_param_grid = {
+              'pca__n_components': [4, 8, 12, 16],
+              'clf__C': [0.01, 0.1, 1.0, 10.0, 100.0]
+          }
+
+          def fit_tuned_svm(X, y, tr, te, inner_seed):
+              pipe = Pipeline([
+                  ('scale', StandardScaler()),
+                  ('pca', PCA(random_state=inner_seed)),
+                  ('clf', SVC(kernel='linear'))
+              ])
+              inner = StratifiedKFold(n_splits=INNER_FOLDS, shuffle=True, random_state=inner_seed)
+              gs = GridSearchCV(pipe, svm_param_grid, cv=inner, scoring='roc_auc', n_jobs=-1, refit=True)
+              gs.fit(X[tr], y[tr])
+              pred = gs.predict(X[te])
+              score = gs.decision_function(X[te])
+              return pred, score, gs.best_params_, float(gs.best_score_)
+
+          class GatedFusion(nn.Module):
+              def __init__(self, d, latent, hidden, dropout):
+                  super().__init__()
+                  self.enc_s = nn.Sequential(nn.Linear(d, hidden), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden, latent), nn.ReLU())
+                  self.enc_f = nn.Sequential(nn.Linear(d, hidden), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden, latent), nn.ReLU())
+                  self.gate = nn.Linear(latent*2, 2)
+                  self.cls = nn.Sequential(nn.Linear(latent*2, hidden), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden, 1))
+              def forward(self, xs, xf):
+                  zs = self.enc_s(xs); zf = self.enc_f(xf)
+                  w = torch.softmax(self.gate(torch.cat([zs,zf], dim=1)), dim=1)
+                  fused = w[:,0:1]*zs + w[:,1:2]*zf
+                  interaction = zs*zf
+                  logits = self.cls(torch.cat([fused, interaction], dim=1)).squeeze(1)
+                  return logits, w
+
+          NN_CONFIGS = [
+              {'pca':8, 'latent':6, 'hidden':12, 'dropout':0.30, 'lr':0.003, 'wd':0.01},
+              {'pca':8, 'latent':8, 'hidden':16, 'dropout':0.40, 'lr':0.003, 'wd':0.01},
+              {'pca':12,'latent':8, 'hidden':16, 'dropout':0.40, 'lr':0.002, 'wd':0.01},
+              {'pca':12,'latent':10,'hidden':20, 'dropout':0.50, 'lr':0.002, 'wd':0.02},
+          ]
+
+          def prep(Xs0, Xf0, tr, va, pca_n, seed):
+              ss=StandardScaler().fit(Xs0[tr]); fs=StandardScaler().fit(Xf0[tr])
+              st=ss.transform(Xs0[tr]); sv=ss.transform(Xs0[va])
+              ft=fs.transform(Xf0[tr]); fv=fs.transform(Xf0[va])
+              ncomp=min(pca_n,len(tr)-2)
+              ps=PCA(n_components=ncomp,random_state=seed).fit(st); pf=PCA(n_components=ncomp,random_state=seed).fit(ft)
+              return ps.transform(st).astype(np.float32), ps.transform(sv).astype(np.float32), pf.transform(ft).astype(np.float32), pf.transform(fv).astype(np.float32)
+
+          def train_nn(st,ft,yt,sv,fv,yv,cfg,seed,max_epochs=180,patience=25):
+              seed_all(seed)
+              net=GatedFusion(st.shape[1],cfg['latent'],cfg['hidden'],cfg['dropout'])
+              opt=torch.optim.AdamW(net.parameters(),lr=cfg['lr'],weight_decay=cfg['wd'])
+              loss_fn=nn.BCEWithLogitsLoss()
+              ts=torch.from_numpy(st); tf=torch.from_numpy(ft); ty=torch.from_numpy(yt.astype(np.float32))
+              vs=torch.from_numpy(sv); vf=torch.from_numpy(fv)
+              best_auc=-1; best_state=None; best_epoch=1; wait=0
+              for ep in range(1,max_epochs+1):
+                  net.train(); opt.zero_grad(); logit,_=net(ts,tf); loss=loss_fn(logit,ty); loss.backward(); opt.step()
+                  net.eval()
+                  with torch.no_grad(): prob=torch.sigmoid(net(vs,vf)[0]).numpy()
+                  auc=roc_auc_score(yv,prob)
+                  if auc>best_auc+1e-6:
+                      best_auc=auc; best_epoch=ep; best_state={k:v.detach().clone() for k,v in net.state_dict().items()}; wait=0
+                  else:
+                      wait+=1
+                  if wait>=patience: break
+              net.load_state_dict(best_state)
+              return float(best_auc), int(best_epoch)
+
+          def tune_nn(Xs0,Xf0,y0,tr,te,seed):
+              inner=StratifiedKFold(n_splits=INNER_FOLDS,shuffle=True,random_state=seed)
+              local_y=y0[tr]
+              scores=[]; epochs=[]
+              for ci,cfg in enumerate(NN_CONFIGS):
+                  aucs=[]; eps=[]
+                  for ii,(itr0,iva0) in enumerate(inner.split(np.zeros(len(tr)),local_y)):
+                      itr=tr[itr0]; iva=tr[iva0]
+                      st,sv,ft,fv=prep(Xs0,Xf0,itr,iva,cfg['pca'],seed+ci*100+ii)
+                      auc,ep=train_nn(st,ft,y0[itr],sv,fv,y0[iva],cfg,seed+ci*1000+ii)
+                      aucs.append(auc); eps.append(ep)
+                  scores.append(float(np.mean(aucs))); epochs.append(int(np.median(eps)))
+              bi=int(np.argmax(scores)); cfg=NN_CONFIGS[bi].copy(); ep=max(10,epochs[bi])
+              ss=StandardScaler().fit(Xs0[tr]); fs=StandardScaler().fit(Xf0[tr])
+              st0=ss.transform(Xs0[tr]); se0=ss.transform(Xs0[te]); ft0=fs.transform(Xf0[tr]); fe0=fs.transform(Xf0[te])
+              ncomp=min(cfg['pca'],len(tr)-2)
+              ps=PCA(n_components=ncomp,random_state=seed).fit(st0); pf=PCA(n_components=ncomp,random_state=seed).fit(ft0)
+              st=ps.transform(st0).astype(np.float32); se=ps.transform(se0).astype(np.float32)
+              ft=pf.transform(ft0).astype(np.float32); fe=pf.transform(fe0).astype(np.float32)
+              seed_all(seed+99999)
+              net=GatedFusion(ncomp,cfg['latent'],cfg['hidden'],cfg['dropout'])
+              opt=torch.optim.AdamW(net.parameters(),lr=cfg['lr'],weight_decay=cfg['wd'])
+              loss_fn=nn.BCEWithLogitsLoss(); ts=torch.from_numpy(st); tf=torch.from_numpy(ft); ty=torch.from_numpy(y0[tr].astype(np.float32))
+              net.train()
+              for _ in range(ep):
+                  opt.zero_grad(); logit,_=net(ts,tf); loss=loss_fn(logit,ty); loss.backward(); opt.step()
+              net.eval()
+              with torch.no_grad():
+                  logit,w=net(torch.from_numpy(se),torch.from_numpy(fe)); prob=torch.sigmoid(logit).numpy(); pred=(prob>=0.5).astype(int)
+              return pred,prob,{'best_config':cfg,'inner_auc':scores[bi],'epochs':ep,'mean_structural_gate':float(w[:,0].mean()),'mean_functional_gate':float(w[:,1].mean())}
+
+          split_id=0
+          for rep in range(N_REPEATS):
+              outer=StratifiedKFold(n_splits=OUTER_FOLDS,shuffle=True,random_state=BASE_SEED+rep)
+              for fold,(tr,te) in enumerate(outer.split(Xs,y),start=1):
+                  split_id+=1; seed=BASE_SEED+rep*100+fold
+                  for name,X in [(MODELS[0],Xs),(MODELS[1],Xf),(MODELS[2],Xcat)]:
+                      pred,score,bp,ia=fit_tuned_svm(X,y,tr,te,seed)
+                      md=metric_dict(y[te],pred,score); fold_rows.append({'model':name,'repeat':rep+1,'fold':fold,'split_id':split_id,**md,'inner_best_auc':ia,'best_params':json.dumps(bp,sort_keys=True)})
+                      pooled_conf[name]+=confusion_matrix(y[te],pred,labels=[0,1])
+                      for j,s in enumerate(te): prediction_rows.append({'model':name,'repeat':rep+1,'fold':fold,'subject':int(s),'y_true':int(y[s]),'pred':int(pred[j]),'score':float(score[j])})
+                  pred,score,meta=tune_nn(Xs,Xf,y,tr,te,seed)
+                  md=metric_dict(y[te],pred,score); fold_rows.append({'model':MODELS[3],'repeat':rep+1,'fold':fold,'split_id':split_id,**md,'inner_best_auc':meta['inner_auc'],'best_params':json.dumps(meta['best_config'],sort_keys=True),'epochs':meta['epochs'],'mean_structural_gate':meta['mean_structural_gate'],'mean_functional_gate':meta['mean_functional_gate']})
+                  pooled_conf[MODELS[3]]+=confusion_matrix(y[te],pred,labels=[0,1])
+                  for j,s in enumerate(te): prediction_rows.append({'model':MODELS[3],'repeat':rep+1,'fold':fold,'subject':int(s),'y_true':int(y[s]),'pred':int(pred[j]),'score':float(score[j])})
+
+          folds=pd.DataFrame(fold_rows); preds=pd.DataFrame(prediction_rows)
+          metric_cols=['accuracy','precision','sensitivity_recall','specificity','f1','auc']
+          summary=[]
+          for m in MODELS:
+              sub=folds[folds.model==m]; r={'model':m,'n_outer_folds':int(len(sub))}
+              for k in metric_cols: r[k+'_mean']=float(sub[k].mean()); r[k+'_sd']=float(sub[k].std(ddof=1))
+              cm=pooled_conf[m]; r.update({'pooled_tn':int(cm[0,0]),'pooled_fp':int(cm[0,1]),'pooled_fn':int(cm[1,0]),'pooled_tp':int(cm[1,1])}); summary.append(r)
+
+          def corrected_ttest(diffs,ratio=0.25):
+              d=np.asarray(diffs,float); n=len(d); mean=float(np.mean(d)); s2=float(np.var(d,ddof=1)); se=math.sqrt((1/n+ratio)*s2) if s2>0 else 0.0
+              if se==0: return mean,0.0,1.0,mean,mean
+              t=mean/se; p=float(2*stats.t.sf(abs(t),df=n-1)); crit=float(stats.t.ppf(0.975,df=n-1)); return mean,float(t),p,float(mean-crit*se),float(mean+crit*se)
+
+          stats_rows=[]; target=MODELS[3]
+          for metric in ['accuracy','auc']:
+              temp=[]; pvals=[]; tv=folds[folds.model==target].sort_values('split_id')[metric].values
+              for base in MODELS[:3]:
+                  bv=folds[folds.model==base].sort_values('split_id')[metric].values
+                  mean,t,p,lo,hi=corrected_ttest(tv-bv); temp.append({'metric':metric,'comparison':f'{target} - {base}','mean_difference':mean,'t_corrected':t,'p_raw':p,'ci95_low':lo,'ci95_high':hi}); pvals.append(p)
+              order=np.argsort(pvals); adj=np.empty(len(pvals)); vals=[]
+              for rank,idx0 in enumerate(order): vals.append((idx0,min(1.0,pvals[idx0]*(len(pvals)-rank))))
+              running=0.0
+              for idx0,val in vals: running=max(running,val); adj[idx0]=running
+              for i,row in enumerate(temp): row['p_holm']=float(adj[i]); stats_rows.append(row)
+
+          out={'dataset':'BiomarkersSCHZ 83-node precomputed structural + functional connectome features','n_subjects':54,'class_1_n':27,'class_0_n':27,'validation':'5 repeats x 5-fold outer stratified CV with 4-fold inner tuning','scope_note':'Rigorous connectome-feature experiment; not the final raw-sMRI 3D-CNN + rs-fMRI BiGRU experiment.','label_note':'Sensitivity treats repository label 1 as positive; specificity treats label 0 as negative.','summary':summary,'statistical_comparisons':stats_rows}
+          folds.to_csv(OUT/'outer_fold_metrics.csv',index=False); preds.to_csv(OUT/'repeated_oof_predictions.csv',index=False); pd.DataFrame(summary).to_csv(OUT/'summary_metrics.csv',index=False); pd.DataFrame(stats_rows).to_csv(OUT/'corrected_statistical_tests.csv',index=False)
+          with open(OUT/'nested_results.json','w') as f: json.dump(out,f,indent=2)
+          print('FINAL_NESTED_RESULTS_START'); print(json.dumps(out,indent=2,sort_keys=True)); print('FINAL_NESTED_RESULTS_END')
+          PY
+          python /tmp/run_nested.py
+
+      - name: Upload nested-CV results
+        uses: actions/upload-artifact@v4
+        with:
+          name: schz-repeated-nested-cv-results
+          path: nested_outputs/
+          retention-days: 14
